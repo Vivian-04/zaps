@@ -11,8 +11,8 @@ use crate::{
     config::Config,
     http::{
         admin, analytics, audit, auth, batches, currency, disputes, files, health, identity, jobs,
-        metrics as metrics_http, notifications, payments, payouts, profiles, transfers, version as version_http,
-        withdrawals, webhooks,
+        metrics as metrics_http, notifications, payments, payouts, profiles, transfers,
+        version as version_http, versioning as versioning_http, withdrawals, webhooks,
     },
     http::{
         get_reconciliation_audit_log, get_reconciliations, resolve_reconciliation,
@@ -304,6 +304,27 @@ pub async fn create_app(
         );
 
     // =========================================================================
+    // API versioning system routes (public, no auth)
+    // =========================================================================
+    let versioning_routes = Router::new()
+        .route(
+            "/versioning/negotiate",
+            get(versioning_http::negotiate_version),
+        )
+        .route(
+            "/versioning/deprecations",
+            get(versioning_http::list_deprecations),
+        )
+        .route(
+            "/versioning/:version/capabilities",
+            get(versioning_http::get_version_capabilities),
+        )
+        .route(
+            "/versioning/compatibility/:version",
+            get(versioning_http::check_compatibility),
+        );
+
+    // =========================================================================
     // Anchor & public routes
     // =========================================================================
     let anchor_routes =
@@ -325,6 +346,8 @@ pub async fn create_app(
         .nest("/api/v2", api_v2)
         // Version documentation (public)
         .nest("/api", version_doc_routes)
+        // API versioning system (public)
+        .nest("/api", versioning_routes)
         // Legacy unversioned public routes (backward compat)
         .merge(public_routes)
         .with_state(services)

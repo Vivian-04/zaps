@@ -1,6 +1,6 @@
 use axum::{
     extract::Request,
-    http::{header::HeaderName, HeaderValue},
+    http::{header::HeaderName, HeaderMap, HeaderValue},
     middleware::Next,
     response::Response,
 };
@@ -21,12 +21,19 @@ impl ApiVersion {
         }
     }
 
+    pub fn as_numeric(&self) -> u32 {
+        match self {
+            ApiVersion::V1 => 1,
+            ApiVersion::V2 => 2,
+        }
+    }
+
     /// Whether this version is deprecated
     pub fn is_deprecated(&self) -> bool {
         matches!(self, ApiVersion::V1)
     }
 
-    /// Sunset date for deprecated versions (RFC 7231 HTTP-date format)
+    /// Sunset date for deprecated versions (RFC 2822 HTTP-date format)
     pub fn sunset_date(&self) -> Option<&'static str> {
         match self {
             ApiVersion::V1 => Some("Sun, 01 Jan 2027 00:00:00 GMT"),
@@ -50,37 +57,60 @@ impl ApiVersion {
             _ => None,
         }
     }
+
+    /// Parse from a header or query-string value — accepts "v1", "v2", "1", "2"
+    pub fn from_header_value(value: &str) -> Option<Self> {
+        match value.trim() {
+            "v1" | "1" => Some(ApiVersion::V1),
+            "v2" | "2" => Some(ApiVersion::V2),
+            _ => None,
+        }
+    }
+
+    /// The latest stable API version
+    pub fn latest() -> Self {
+        ApiVersion::V2
+    }
 }
 
-/// Axum middleware that injects API version headers and records version usage analytics.
-///
-/// Adds the following response headers:
-/// - `X-API-Version`: the resolved version (e.g. "v1")
-/// - `Deprecation`: RFC 8594 deprecation header (if version is deprecated)
-/// - `Sunset`: date after which the version will be removed (if deprecated)
-/// - `Link`: link to migration guide (if deprecated)
-pub async fn version_middleware(request: Request, next: Next) -> Response {
-    // Extract version from the request path (e.g. /api/v1/... → "v1")
-    let path = request.uri().path().to_string();
-    let version = extract_version_from_path(&path);
+/// Stored in request extensions so downstream handlers can inspect the active version.
+#[derive(Debug, Clone, Copy)]
+pub struct ApiVersionExtension(pub ApiVersion);
 
-    // Record version usage analytics via Prometheus
+/// Axum middleware that resolves the API version, stores it in request extensions,
+/// and injects version/deprecation headers into responses.
+///
+/// Version resolution order:
+///   1. Path segment (`/api/v2/...`)
+///   2. Request header (`X-API-Version`, `Accept-Version`, or `API-Version`)
+///   3. Default to V1 for backward compatibility
+///
+/// Response headers added:
+///   - `X-API-Version`   — resolved version string
+///   - `Deprecation`     — "true" when the version is deprecated (RFC 8594)
+///   - `Sunset`          — removal date for deprecated versions
+///   - `Link`            — URL to the migration guide
+///   - `Warning`         — RFC 7234 299 warning with human-readable deprecation notice
+pub async fn version_middleware(mut request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+
+    let version = extract_version_from_path(&path)
+        .or_else(|| extract_version_from_headers(request.headers()))
+        .unwrap_or(ApiVersion::V1);
+
+    // Make the resolved version available to handlers
+    request.extensions_mut().insert(ApiVersionExtension(version));
+
     MetricsService::record_api_version_usage(version.as_str(), &path);
 
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
 
-    // Always inject the resolved version
     if let Ok(val) = HeaderValue::from_str(version.as_str()) {
-        headers.insert(
-            HeaderName::from_static("x-api-version"),
-            val,
-        );
+        headers.insert(HeaderName::from_static("x-api-version"), val);
     }
 
-    // Inject deprecation headers when applicable
     if version.is_deprecated() {
-        // RFC 8594 Deprecation header — use a boolean "true" value
         headers.insert(
             HeaderName::from_static("deprecation"),
             HeaderValue::from_static("true"),
@@ -99,9 +129,22 @@ pub async fn version_middleware(request: Request, next: Next) -> Response {
             }
         }
 
-        tracing::debug!(
+        // RFC 7234 §5.5 Warning header — code 299 = "Miscellaneous persistent warning"
+        let warning = format!(
+            r#"299 - "API {} is deprecated and will be removed on {}. Migrate to {}: {}""#,
+            version.as_str(),
+            version.sunset_date().unwrap_or("TBD"),
+            ApiVersion::latest().as_str(),
+            version.migration_guide_url().unwrap_or("https://docs.blinks.app/api"),
+        );
+        if let Ok(val) = HeaderValue::from_str(&warning) {
+            headers.insert(HeaderName::from_static("warning"), val);
+        }
+
+        tracing::warn!(
             api_version = version.as_str(),
             path = %path,
+            sunset = version.sunset_date().unwrap_or("unknown"),
             "Deprecated API version used"
         );
     }
@@ -109,17 +152,26 @@ pub async fn version_middleware(request: Request, next: Next) -> Response {
     response
 }
 
-/// Extract the API version from a URL path.
-/// Looks for a path segment matching "v1", "v2", etc.
-/// Falls back to V1 if no version segment is found (backward compatibility).
-fn extract_version_from_path(path: &str) -> ApiVersion {
+fn extract_version_from_path(path: &str) -> Option<ApiVersion> {
     for segment in path.split('/') {
         if let Some(version) = ApiVersion::from_path_segment(segment) {
-            return version;
+            return Some(version);
         }
     }
-    // Default to V1 for unversioned paths (backward compat)
-    ApiVersion::V1
+    None
+}
+
+fn extract_version_from_headers(headers: &HeaderMap) -> Option<ApiVersion> {
+    for header_name in &["x-api-version", "accept-version", "api-version"] {
+        if let Some(val) = headers.get(*header_name) {
+            if let Ok(s) = val.to_str() {
+                if let Some(v) = ApiVersion::from_header_value(s) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -128,9 +180,9 @@ mod tests {
 
     #[test]
     fn test_extract_version_from_path() {
-        assert_eq!(extract_version_from_path("/api/v1/payments"), ApiVersion::V1);
-        assert_eq!(extract_version_from_path("/api/v2/payments"), ApiVersion::V2);
-        assert_eq!(extract_version_from_path("/health"), ApiVersion::V1); // default
+        assert_eq!(extract_version_from_path("/api/v1/payments"), Some(ApiVersion::V1));
+        assert_eq!(extract_version_from_path("/api/v2/payments"), Some(ApiVersion::V2));
+        assert_eq!(extract_version_from_path("/health"), None);
     }
 
     #[test]
@@ -143,5 +195,32 @@ mod tests {
     fn test_sunset_date() {
         assert!(ApiVersion::V1.sunset_date().is_some());
         assert!(ApiVersion::V2.sunset_date().is_none());
+    }
+
+    #[test]
+    fn test_from_header_value() {
+        assert_eq!(ApiVersion::from_header_value("v1"), Some(ApiVersion::V1));
+        assert_eq!(ApiVersion::from_header_value("v2"), Some(ApiVersion::V2));
+        assert_eq!(ApiVersion::from_header_value("1"), Some(ApiVersion::V1));
+        assert_eq!(ApiVersion::from_header_value("2"), Some(ApiVersion::V2));
+        assert_eq!(ApiVersion::from_header_value("  v2  "), Some(ApiVersion::V2));
+        assert_eq!(ApiVersion::from_header_value("v3"), None);
+        assert_eq!(ApiVersion::from_header_value(""), None);
+    }
+
+    #[test]
+    fn test_latest_is_v2() {
+        assert_eq!(ApiVersion::latest(), ApiVersion::V2);
+    }
+
+    #[test]
+    fn test_as_numeric() {
+        assert_eq!(ApiVersion::V1.as_numeric(), 1);
+        assert_eq!(ApiVersion::V2.as_numeric(), 2);
+    }
+
+    #[test]
+    fn test_version_ordering() {
+        assert!(ApiVersion::V1 < ApiVersion::V2);
     }
 }

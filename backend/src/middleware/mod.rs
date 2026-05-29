@@ -11,4 +11,4 @@ pub use auth::*;
 pub use metrics::*;
 pub use request_id::*;
 pub use role_guard::*;
-pub use versioning::version_middleware;
+pub use versioning::{version_middleware, ApiVersion, ApiVersionExtension};

@@ -18,6 +18,7 @@ pub mod profiles;
 pub mod reconciliation;
 pub mod transfers;
 pub mod version;
+pub mod versioning;
 pub mod withdrawals;
 pub mod webhooks;
 
@@ -44,5 +45,6 @@ pub use reconciliation::{
 };
 pub use transfers::*;
 pub use version::*;
+pub use versioning::*;
 pub use withdrawals::*;
 pub use webhooks::*;

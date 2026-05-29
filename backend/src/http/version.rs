@@ -103,7 +103,7 @@ fn v2_info() -> VersionInfo {
 pub async fn list_versions() -> Json<VersionListResponse> {
     Json(VersionListResponse {
         versions: vec![v1_info(), v2_info()],
-        current_version: "v1",
+        current_version: "v2",
         latest_version: "v2",
     })
 }
